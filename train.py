@@ -17,21 +17,24 @@ from loss.loss import *
 # Hyperparameter
 base_dir = "/home/chi/Downloads/flicker-text-to-image/flickr30k_images/flickr30k_images/"
 xls_datapath = "/home/chi/Documents/Deep-Learning-Project/Text-To-Image/results.xlsx"
-device = "gpu" if torch.cuda.is_available() else "cpu" 
-beta_value = (0.5,0.999) # It's control how much the optimizer rememeber previous gradient.
-learning_rate=0.0002
-embedding_dim = 512
-text = ["Original Image","Image + Noise","Actual Noise","Predicted Noise"]
-epoch = 100 
-image_channels = 3 # input image channel
-image_size = 256  # Reduced image size for this example
-output_channel = 3 
+# hyperparameters
 
 # diffusion hyperparameters
-timesteps = 500
+timesteps = 1000
 beta1 = 1e-4
 beta2 = 0.02
 
+# network hyperparameters
+device = torch.device("cuda:0" if torch.cuda.is_available() else torch.device('cpu'))
+n_feat = 64 # 64 hidden dimension feature
+n_cfeat = 512 # context vector is of size 5
+height = 64 # 16x16 image
+save_dir = './weights/'
+
+# training hyperparameters
+batch_size = 100
+n_epoch = 32
+lrate=1e-3
 # construct DDPM noise schedule
 b_t = (beta2 - beta1) * torch.linspace(0, 1, timesteps + 1, device=device) + beta1
 a_t = 1 - b_t
@@ -48,62 +51,41 @@ def perturb_input(x, t, noise):
 
 
 def train(epoch):
-    generator,disc,gen_opt,disc_opt = ut.get_model(image_channels,output_channel,embedding_dim,
-                                                              image_size,learning_rate,beta_value)
+    generator,gen_opt = ut.get_model(in_channels=3,out_channels=n_feat,embedding_dim=n_cfeat,image_size=height,learning_rat=lrate)
 
-    dataloader = ut.gat_dataloader(base_dir=base_dir,data_filepath=xls_datapath,target_size=(image_size,image_size))    
+    dataloader = ut.gat_dataloader(base_dir=base_dir,data_filepath=xls_datapath,target_size=(height,height))    
 
     for e in range(epoch):
 
         generator.train()
-        disc.train()
-        gen_opt.param_groups[0]['lr'] = learning_rate*(1-e/epoch)
-        disc_opt.param_groups[0]['lr'] = learning_rate*(1-e/epoch)
-        i = 0
+        
+        gen_opt.param_groups[0]['lr'] = lrate*(1-e/epoch)
         
         for (image, emb_value,txt) in tqdm(dataloader):
             gen_opt.zero_grad()
             image = image.to(device)
-            emb_value = emb_value.to(device)
+            emb_value = emb_value.squeeze().to(device)
 
             # perturb data
             noise = torch.randn_like(image)
             t = torch.randint(1, timesteps + 1, (image.shape[0],)).to(device)
             x_pert = perturb_input(image, t, noise)
             pt = generator(x_pert,emb_value,t/timesteps)
-
-            # Train Discriminator
-            real_pred = disc(noise)
-            fake_pred = disc(pt.detach())
-            real_loss = bce_loss(real_pred,torch.ones_like(real_pred))
-            fake_loss = bce_loss(fake_pred,torch.zeros_like(fake_pred))
-            disc_loss = real_loss + fake_loss
-            disc_loss.backward()
-            disc_opt.step()
-
-            # Train Generator
-            gfake_pred = disc(pt)
-            gfake_loss = bce_loss(gfake_pred,torch.ones_like(gfake_pred))
-            mloss = gfake_loss + mse_loss(pt,noise)
-            mloss.backward()
+            # loss is mean squared error between the predicted and true noise
+            loss = ut.mse_loss(pred_noise, noise)
+            total_loss.append(loss.item())
+            loss.backward()
             gen_opt.step()
+           
+           # save model periodically
+        if ep%4==0 or ep == int(n_epoch-1):
+            if not os.path.exists(save_dir):
+                os.mkdir(save_dir)
+            torch.save(generator.state_dict(), save_dir + f"context_model_{ep}.pth")
+            print('saved model at ' + save_dir + f"context_model_{ep}.pth")
+            print(f"Loss>>>>>{sum(total_loss)/len(dataloader)}")
 
-            x_tack = torch.stack([image.squeeze().detach().cpu(),
-                              x_pert.squeeze().detach().cpu(),
-                              noise.squeeze().detach().cpu(),
-                              pt.squeeze().detach().cpu()])
-            print(f"Epoch: {e}, GAN Loss : {mloss.item()} , Disc Loss: {disc_loss.item()}")# Decoder Loss: {deloss.item()}")
-            ut.show_tensor_images_train(x_tack,text)
-
-            torch.save(obj=generator.state_dict(),f="load_model_weight/DGenerator.pth")
-            torch.save(obj=disc.state_dict(),f='load_model_weight/DDisc.pth')
-
-            if i%10 == 0 and i != 0:
-                print(f"Clear Output {i}")
-                clear_output()
-            i += 1
-
-            torch.cuda.empty_cache()
+        
 
 if __name__ == "__main__":
     # Train Diffusion Generative Model
