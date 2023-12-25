@@ -25,17 +25,17 @@ class Utils():
         dataloader = DataLoader(dataset,batch_size=1,shuffle=True,num_workers=4)
         return dataloader
 
-    def get_model(self,in_channels,n_feat,embedding_dim,
+    def get_model(self,in_channels,out_channel,embedding_dim,
                         image_size, learning_rate, beta_value=(0.9,0.999),
-                        device='cpu', if_pretrain=False,gan_path=None):
+                        device='cpu', gan_path=None):
         
-        gan = nn.DataParallel(Generator(in_channels,n_feat,embedding_dim,image_size).to(device))
+        gan = nn.DataParallel(Generator(in_channels,out_channel,embedding_dim,image_size).to(device))
 
         # Create the optimizer with Adam (or any other optimizer you prefer)
         g_optim = optim.Adam(gan.parameters(), lr=learning_rate,betas=beta_value)
         
 
-        if if_pretrain:
+        if gan_path is not None:
             print("Using pretrained model")
             gan_statedict = torch.load(gan_path)
             gan.load_state_dict(gan_statedict)

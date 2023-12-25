@@ -4,116 +4,73 @@ import numpy as np
 from torchvision.utils import save_image, make_grid
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation, PillowWriter
-import os
-import torchvision.transforms as transforms
-from torch.utils.data import Dataset
-from PIL import Image
+import math 
+import torch.nn.functional  as F
 
+def scaled_dot_product(q, k, v, mask=None):
+    d_k = q.size()[-1]
+    attn_logits = torch.matmul(q, k.transpose(-2, -1))
+    attn_logits = attn_logits / math.sqrt(d_k)
+    if mask is not None:
+        attn_logits = attn_logits.masked_fill(mask == 0, -9e15)
+    attention = F.softmax(attn_logits, dim=-1)
+    values = torch.matmul(attention, v)
+    return values, attention
 
-class ResidualConvBlock(nn.Module):
-    def __init__(
-        self, in_channels: int, out_channels: int, is_res: bool = False
-    ) -> None:
+def expand_mask(mask):
+    assert mask.ndim > 2, "Mask must be at least 2-dimensional with seq_length x seq_length"
+    if mask.ndim == 3:
+        mask = mask.unsqueeze(1)
+    while mask.ndim < 4:
+        mask = mask.unsqueeze(0)
+    return mask
+
+class MultiheadAttention(nn.Module):
+
+    def __init__(self, input_dim, embed_dim, num_heads):
         super().__init__()
+        assert embed_dim % num_heads == 0, "Embedding dimension must be 0 modulo number of heads."
 
-        # Check if input and output channels are the same for the residual connection
-        self.same_channels = in_channels == out_channels
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.head_dim = embed_dim // num_heads
 
-        # Flag for whether or not to use residual connection
-        self.is_res = is_res
+        # Stack all weight matrices 1...h together for efficiency
+        # Note that in many implementations you see "bias=False" which is optional
+        self.qkv_proj = nn.Linear(input_dim, 3*embed_dim)
+        self.o_proj = nn.Linear(embed_dim, embed_dim)
 
-        # First convolutional layer
-        self.conv1 = nn.Sequential(
-            nn.Conv2d(in_channels, out_channels, 3, 1, 1),   # 3x3 kernel with stride 1 and padding 1
-            nn.BatchNorm2d(out_channels),   # Batch normalization
-            nn.GELU(),   # GELU activation function
-        )
+        self._reset_parameters()
 
-        # Second convolutional layer
-        self.conv2 = nn.Sequential(
-            nn.Conv2d(out_channels, out_channels, 3, 1, 1),   # 3x3 kernel with stride 1 and padding 1
-            nn.BatchNorm2d(out_channels),   # Batch normalization
-            nn.GELU(),   # GELU activation function
-        )
+    def _reset_parameters(self):
+        # Original Transformer initialization, see PyTorch documentation
+        nn.init.xavier_uniform_(self.qkv_proj.weight)
+        self.qkv_proj.bias.data.fill_(0)
+        nn.init.xavier_uniform_(self.o_proj.weight)
+        self.o_proj.bias.data.fill_(0)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x, mask=None, return_attention=False):
+        batch_size, seq_length, _ = x.size()
+        if mask is not None:
+            mask = expand_mask(mask)
+        qkv = self.qkv_proj(x)
 
-        # If using residual connection
-        if self.is_res:
-            # Apply first convolutional layer
-            x1 = self.conv1(x)
+        # Separate Q, K, V from linear output
+        qkv = qkv.reshape(batch_size, seq_length, self.num_heads, 3*self.head_dim)
+        qkv = qkv.permute(0, 2, 1, 3) # [Batch, Head, SeqLen, Dims]
+        q, k, v = qkv.chunk(3, dim=-1)
 
-            # Apply second convolutional layer
-            x2 = self.conv2(x1)
+        # Determine value outputs
+        values, attention = scaled_dot_product(q, k, v, mask=mask)
+        values = values.permute(0, 2, 1, 3) # [Batch, SeqLen, Head, Dims]
+        values = values.reshape(batch_size, seq_length, self.embed_dim)
+        o = self.o_proj(values)
 
-            # If input and output channels are the same, add residual connection directly
-            if self.same_channels:
-                out = x + x2
-            else:
-                # If not, apply a 1x1 convolutional layer to match dimensions before adding residual connection
-                shortcut = nn.Conv2d(x.shape[1], x2.shape[1], kernel_size=1, stride=1, padding=0).to(x.device)
-                out = shortcut(x) + x2
-            #print(f"resconv forward: x {x.shape}, x1 {x1.shape}, x2 {x2.shape}, out {out.shape}")
-
-            # Normalize output tensor
-            return out / 1.414
-
-        # If not using residual connection, return output of second convolutional layer
+        if return_attention:
+            return o, attention
         else:
-            x1 = self.conv1(x)
-            x2 = self.conv2(x1)
-            return x2
+            return o
 
-    # Method to get the number of output channels for this block
-    def get_out_channels(self):
-        return self.conv2[0].out_channels
-
-    # Method to set the number of output channels for this block
-    def set_out_channels(self, out_channels):
-        self.conv1[0].out_channels = out_channels
-        self.conv2[0].in_channels = out_channels
-        self.conv2[0].out_channels = out_channels
-
-
-
-class UnetUp(nn.Module):
-    def __init__(self, in_channels, out_channels):
-        super(UnetUp, self).__init__()
-
-        # Create a list of layers for the upsampling block
-        # The block consists of a ConvTranspose2d layer for upsampling, followed by two ResidualConvBlock layers
-        layers = [
-            nn.ConvTranspose2d(in_channels, out_channels, 2, 2),
-            ResidualConvBlock(out_channels, out_channels),
-            ResidualConvBlock(out_channels, out_channels),
-        ]
-
-        # Use the layers to create a sequential model
-        self.model = nn.Sequential(*layers)
-
-    def forward(self, x, skip):
-        # Concatenate the input tensor x with the skip connection tensor along the channel dimension
-        x = torch.cat((x, skip), 1)
-
-        # Pass the concatenated tensor through the sequential model and return the output
-        x = self.model(x)
-        return x
-
-
-class UnetDown(nn.Module):
-    def __init__(self, in_channels, out_channels):
-        super(UnetDown, self).__init__()
-
-        # Create a list of layers for the downsampling block
-        # Each block consists of two ResidualConvBlock layers, followed by a MaxPool2d layer for downsampling
-        layers = [ResidualConvBlock(in_channels, out_channels), ResidualConvBlock(out_channels, out_channels), nn.MaxPool2d(2)]
-
-        # Use the layers to create a sequential model
-        self.model = nn.Sequential(*layers)
-
-    def forward(self, x):
-        # Pass the input through the sequential model and return the output
-        return self.model(x)
 
 class EmbedFC(nn.Module):
     def __init__(self, input_dim, emb_dim):
@@ -123,11 +80,10 @@ class EmbedFC(nn.Module):
         dimensionality input_dim to an embedding space of dimensionality emb_dim.
         '''
         self.input_dim = input_dim
-
         # define the layers for the network
         layers = [
             nn.Linear(input_dim, emb_dim),
-            nn.GELU(),
+            nn.SiLU(),
             nn.Linear(emb_dim, emb_dim),
         ]
 
@@ -138,7 +94,118 @@ class EmbedFC(nn.Module):
         # flatten the input tensor
         x = x.view(-1, self.input_dim)
         # apply the model layers to the flattened tensor
-        return self.model(x)
+        out = self.model(x)
+        return out
+
+class Perior(nn.Module):
+
+    def __init__(self,):
+        super(Perior,self).__init__()
+        # self.model, self.preprocess = clip.load("ViT-B/32", device='cpu')
+        # self.model.zero_grad = False
+        self.multihead = MultiheadAttention(512,512,512)
+        self.li1 = nn.Linear(512,512)
+        self.li2 = nn.Linear(512,512)
+
+
+    def forward(self,c):
+        last_output = self.multihead(c.unsqueeze(dim=0))
+        last_output = self.li1(last_output)
+        last_output = self.li2(last_output)
+        return last_output.squeeze()
+
+class ResNetBlock(nn.Module):
+    def __init__(self,in_channels,channels):
+        super(ResNetBlock,self).__init__()
+        self.gn = nn.GroupNorm(channels,channels)
+        self.sact = nn.SiLU()
+        self.conv1 = nn.Conv2d(channels,channels,kernel_size=(3,3),padding=1)
+        self.conv2 = nn.Conv2d(channels,channels,kernel_size=(1,1))
+
+    def forward(self,x):
+        temp = self.conv2(x)
+        x = self.sact(self.gn(x))
+        x = self.conv1(x)
+        x = self.sact(self.gn(x))
+        x = self.conv1(x)
+        output = x + temp
+        return output
+
+
+class SelfAttention(nn.Module):
+    def __init__(self, in_channel):
+        super(SelfAttention, self).__init__()
+
+        #conv f
+        self.conv_f = nn.utils.spectral_norm(nn.Conv2d(in_channel, in_channel//8, 1))
+        #conv_g
+        self.conv_g = nn.utils.spectral_norm(nn.Conv2d(in_channel, in_channel//8, 1))
+        #conv_h
+        self.conv_h = nn.utils.spectral_norm(nn.Conv2d(in_channel, in_channel, 1))
+
+        self.softmax = nn.Softmax(-2) #sum in column j = 1
+        self.gamma = nn.Parameter(torch.zeros(1))
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+        f_projection = self.conv_f(x) #BxC'xHxW, C'=C//8
+        g_projection = self.conv_g(x) #BxC'xHxW
+        h_projection = self.conv_h(x) #BxCxHxW
+
+        f_projection = torch.transpose(f_projection.view(B,-1,H*W), 1, 2) #BxNxC', N=H*W
+        g_projection = g_projection.view(B,-1,H*W) #BxC'xN
+        h_projection = h_projection.view(B,-1,H*W) #BxCxN
+
+        attention_map = torch.bmm(f_projection, g_projection) #BxNxN
+        attention_map = self.softmax(attention_map) #sum_i_N (A i,j) = 1
+
+        #sum_i_N (A i,j) = 1 hence oj = (HxAj) is a weighted sum of input columns
+        out = torch.bmm(h_projection, attention_map) #BxCxN
+        out = out.view(B,C,H,W)
+
+        out = self.gamma*out + x
+        return out
+
+class DBBlock(nn.Module):
+    def __init__(self,channels,out_channels,atten_dim = 64,kernel_size=(3,3),stride=2,num_resblock=2,attention=False):
+        super(DBBlock,self).__init__()
+        self.is_atten = attention
+        self.conv1 = nn.Conv2d(channels,out_channels,kernel_size=kernel_size,stride=stride)
+        self.res = ResNetBlock(out_channels,out_channels)
+        self.attention = SelfAttention(out_channels)#,output_size=43*2)
+        self.num_resblock = num_resblock
+
+    def forward(self,x):
+        x = self.conv1(x)
+        # x = x + emb_value
+        # print(x.shape)
+        for i in range(self.num_resblock):
+            x = self.res(x)
+        if self.is_atten:
+            x = self.attention(x)
+        return x
+
+class UBBlock(nn.Module):
+    def __init__(self,channels,out_channel,kernel_size=(3,3),stride=2,num_resblock=1,is_atten=False,if_skip=True):
+        super(UBBlock,self).__init__()
+        self.is_atten = is_atten
+        self.tconv = nn.ConvTranspose2d(channels,out_channel,kernel_size=kernel_size,stride=stride)
+
+        self.res = ResNetBlock(channels,channels)
+        self.attention = SelfAttention(channels)
+        self.num_resblock = num_resblock
+        self.if_skip=if_skip
+    def forward(self,x,skip=None):
+        if skip is not None:
+            x = torch.cat([x,skip],dim=1)
+
+        for i in range(self.num_resblock):
+            x = self.res(x)
+        if self.is_atten:
+            x = self.attention(x.squeeze())
+        x = self.tconv(x)
+        return x
+
 
 def unorm(x):
     # unity norm. results in range of [0,1]
@@ -200,57 +267,80 @@ def plot_sample(x_gen_store,n_sample,nrows,save_dir, fn,  w, save=False):
     return ani
     
 class Generator(nn.Module):
-    def __init__(self, in_channels, n_feat=256, n_cfeat=10, height=28):  # cfeat - context features
-        super(Generator, self).__init__()
+    def __init__(self,input_channel,output_channel,emb_size,img_size):
+        super(Generator,self).__init__()
 
-        self.in_channels = in_channels
-        self.n_feat = n_feat
-        self.n_cfeat = n_cfeat
-        self.h = height  
+        self.perior = Perior()
+        self.timeemb1 = EmbedFC(1,512)
+        self.timeemb2 = EmbedFC(1,512)
+        self.timeemb3 = EmbedFC(1,512)
+        self.timeemb4 = EmbedFC(1,256)
+        self.timeemb5 = EmbedFC(1,256)
 
-        self.init_conv = ResidualConvBlock(in_channels, n_feat, is_res=True)
+        self.contexemb1 = EmbedFC(emb_size,512)
+        self.contexemb2 = EmbedFC(emb_size,512)
+        self.contexemb3 = EmbedFC(emb_size,512)
+        self.contexemb4 = EmbedFC(emb_size,256)
+        self.contexemb5 = EmbedFC(emb_size,256)
+        # self.mapping_layer = MappingLayers(833,1666,833)
+        self.act = nn.SiLU()
+        self.n_feat = 512
 
-        self.down1 = UnetDown(n_feat, n_feat)        # down1 #[10, 256, 8, 8]
-        self.down2 = UnetDown(n_feat, 2 * n_feat)    # down2 #[10, 256, 4,  4]
+        # # # original: self.to_vec = nn.Sequential(nn.AvgPool2d(7), nn.GELU())
+        self.res = ResNetBlock(input_channel,input_channel)
 
-        self.to_vec = nn.Sequential(nn.AvgPool2d((4)), nn.GELU())
+        self.dblock1 = DBBlock(input_channel,256,kernel_size=3,stride=2,num_resblock=3)
+        self.dblock2 = DBBlock(256,256,kernel_size=3,stride=2,num_resblock=3,attention=True)
+        self.dblock3 = DBBlock(256,512,kernel_size=3,stride=2,num_resblock=3)
+        self.dblock4 = DBBlock(512,512,kernel_size=3,stride=2,num_resblock=6,attention=True)
+        self.dblock5 = DBBlock(512,512,kernel_size=1,stride=1,num_resblock=6)
 
-        self.timeembed1 = EmbedFC(1, 2*n_feat)
-        self.timeembed2 = EmbedFC(1, 1*n_feat)
-        self.contextembed1 = EmbedFC(n_cfeat, 2*n_feat)
-        self.contextembed2 = EmbedFC(n_cfeat, 1*n_feat)
+        self.to_vec = nn.Sequential(nn.AvgPool2d(2), nn.GELU())
 
-        self.up0 = nn.Sequential(
-            nn.ConvTranspose2d(2 * n_feat, 2 * n_feat, self.h//14, self.h//14), # up-sample
-            nn.GroupNorm(8, 2 * n_feat), 
-            nn.ReLU(),
-        )
-        self.up1 = UnetUp(4 * n_feat, n_feat)
-        self.up2 = UnetUp(2 * n_feat, n_feat)
+        self.ublock1 = UBBlock(512,512,kernel_size=(3,3),stride=2,num_resblock=6,is_atten=False,if_skip=False)
+        self.ublock2 = UBBlock(1024,512,kernel_size=(3,3),stride=2,num_resblock=6,is_atten=True)
+        self.ublock3 = UBBlock(1024,256,kernel_size=(3,3),stride=2,num_resblock=3,is_atten=True)
+        self.ublock4 = UBBlock(512,256,kernel_size=(3,3),stride=2,num_resblock=3,is_atten=True)
+        self.ublock5 = UBBlock(512,256,kernel_size=(4,4),stride=2,num_resblock=3,is_atten=True)
 
         self.out = nn.Sequential(
-            nn.Conv2d(2 * n_feat, n_feat, 3, 1, 1), 
-            nn.GroupNorm(8, n_feat), # 
-            nn.ReLU(),
-            nn.Conv2d(n_feat, self.in_channels, 3, 1, 1),
+            nn.Conv2d(259, 256, 3, 1, 1), 
+            nn.GroupNorm(8, 256), 
+            nn.SiLU(),
+            nn.Conv2d(256, 3, 3, 1, 1)
         )
+    def forward(self,x,text_emb,t):
+        # Downsample block is start
+        x = self.res(x)
+        emb = self.perior(text_emb)
+        emb_value = emb.view(-1)
+        db1 = self.dblock1(x)
+        db2 = self.dblock2(db1)
+        db3 = self.dblock3(db2)
+        db4 = self.dblock4(db3)
+        db5 = self.dblock5(db4)
+        vec = self.to_vec(db5)
+        # Downsample block is end
+        time_emb1 = self.timeemb1(t).view(-1,self.n_feat,1,1)
+        emb_value1 = self.contexemb1(emb_value).view(-1,self.n_feat,1,1) #+ time_emb1
 
-    def forward(self, x, t, c):
+        emb_value1 = emb_value.view(-1,self.n_feat,1,1)
+        time_emb2 = self.timeemb2(t).view(-1,self.n_feat,1,1)
+        emb_value2 = self.contexemb2(emb_value).view(-1,self.n_feat,1,1)# + time_emb2
+        time_emb3 = self.timeemb3(t).view(-1,self.n_feat,1,1)
+        emb_value3 = self.contexemb3(emb_value).view(-1,self.n_feat,1,1) #+ time_emb3
+        time_emb4 = self.timeemb4(t).view(-1,self.n_feat//2,1,1)
+        emb_value4 = self.contexemb4(emb_value).view(-1,self.n_feat//2,1,1)
+        time_emb5 = self.timeemb5(t).view(-1,self.n_feat//2,1,1)
+        emb_value5 = self.contexemb5(emb_value).view(-1,self.n_feat//2,1,1)
         
-        x = self.init_conv(x)
-        down1 = self.down1(x)       
-        down2 = self.down2(down1)   
+        # Upsample block is start
+        ub1 = self.act(self.ublock1(vec*emb_value1+time_emb1))
+        ub2 = self.ublock2(ub1*emb_value2+time_emb2,db4)
+        ub3 = self.ublock3(ub2*emb_value3+time_emb3,db3)
+        ub4 = self.ublock4(ub3*emb_value4+time_emb4,db2)
+        ub5 = self.ublock5(ub4*emb_value5+time_emb5,db1)
+        output = self.out(torch.cat((ub5,x),1))
 
-        hiddenvec = self.to_vec(down2)
-        
-        cemb1 = self.contextembed1(c).view(-1, self.n_feat * 2, 1, 1)     # (batch, 2*n_feat, 1,1)
-        temb1 = self.timeembed1(t).view(-1, self.n_feat * 2, 1, 1)
-        cemb2 = self.contextembed2(c).view(-1, self.n_feat, 1, 1)
-        temb2 = self.timeembed2(t).view(-1, self.n_feat, 1, 1)
-
-        up1 = self.up0(hiddenvec)
-        up2 = self.up1(cemb1*up1 + temb1, down2)  
-        up3 = self.up2(cemb2*up2 + temb2, down1)
-        out = self.out(torch.cat((up3, x), 1))
-        return out
+        return output
 

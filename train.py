@@ -2,7 +2,6 @@ from model import Network
 from utilis import Utils
 import torch
 import torchvision
-from IPython.display import clear_output
 import torch.nn.functional as F
 from torchvision import transforms
 from transformers import T5Tokenizer
@@ -13,7 +12,7 @@ from tqdm import tqdm
 import math
 import torch.optim as optim
 from loss.loss import *
-
+import os
 # Hyperparameter
 base_dir = "/home/chi/Downloads/flicker-text-to-image/flickr30k_images/flickr30k_images/"
 xls_datapath = "/home/chi/Documents/Deep-Learning-Project/Text-To-Image/results.xlsx"
@@ -54,7 +53,7 @@ def train(epoch):
     generator,gen_opt = ut.get_model(in_channels=3,out_channels=n_feat,embedding_dim=n_cfeat,image_size=height,learning_rat=lrate)
 
     dataloader = ut.gat_dataloader(base_dir=base_dir,data_filepath=xls_datapath,target_size=(height,height))    
-
+    total_loss = []
     for e in range(epoch):
 
         generator.train()
@@ -62,6 +61,7 @@ def train(epoch):
         gen_opt.param_groups[0]['lr'] = lrate*(1-e/epoch)
         
         for (image, emb_value,txt) in tqdm(dataloader):
+
             gen_opt.zero_grad()
             image = image.to(device)
             emb_value = emb_value.squeeze().to(device)
@@ -72,15 +72,15 @@ def train(epoch):
             x_pert = perturb_input(image, t, noise)
             pt = generator(x_pert,emb_value,t/timesteps)
             # loss is mean squared error between the predicted and true noise
-            loss = ut.mse_loss(pred_noise, noise)
+            loss = ut.mse_loss(pt, noise)
             total_loss.append(loss.item())
             loss.backward()
             gen_opt.step()
            
            # save model periodically
-        if ep%4==0 or ep == int(n_epoch-1):
-            if not os.path.exists(save_dir):
-                os.mkdir(save_dir)
+        
+        if not os.path.exists(save_dir):
+            os.mkdir(save_dir)
             torch.save(generator.state_dict(), save_dir + f"context_model_{ep}.pth")
             print('saved model at ' + save_dir + f"context_model_{ep}.pth")
             print(f"Loss>>>>>{sum(total_loss)/len(dataloader)}")
@@ -89,4 +89,4 @@ def train(epoch):
 
 if __name__ == "__main__":
     # Train Diffusion Generative Model
-    train(epoch)
+    train(epoch=100)
